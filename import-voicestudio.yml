@@ -1,0 +1,60 @@
+name: Import VoiceStudio upstream
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/import-voicestudio.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-voicestudio
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out your repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download official VoiceStudio source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p VoiceStudio
+          tmp="$(mktemp -d)"
+          curl -fL --retry 3 \
+            https://codeload.github.com/debpalash/VoiceStudio/tar.gz/refs/heads/main \
+            -o "$tmp/voicestudio.tar.gz"
+          tar -xzf "$tmp/voicestudio.tar.gz" -C "$tmp"
+          src="$(find "$tmp" -maxdepth 1 -type d -name 'VoiceStudio-*' -print -quit)"
+          if [ -z "$src" ]; then
+            echo "Could not find extracted VoiceStudio source."
+            exit 1
+          fi
+          # Replace only the imported subdirectory; keep your repository files intact.
+          rm -rf VoiceStudio
+          mkdir -p VoiceStudio
+          cp -a "$src"/. VoiceStudio/
+          rm -rf "$tmp"
+
+      - name: Commit imported source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VoiceStudio
+          if git diff --cached --quiet; then
+            echo "VoiceStudio source is already up to date."
+            exit 0
+          fi
+          git commit -m "Import upstream VoiceStudio source"
+          git push
