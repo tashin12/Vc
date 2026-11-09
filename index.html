@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice Switch</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#7a3ff2">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+:root{--bg:#f2f0f7;--ink:#1d1a2b;--mut:#6b6780;--card:#fff;--acc:#7a3ff2;--accink:#fff;--line:#dcd8e8;--rec:#d92d4b}
+@media(prefers-color-scheme:dark){:root{--bg:#13111b;--ink:#efecf8;--mut:#9a95b0;--card:#1d1a2a;--acc:#a98aff;--accink:#14111f;--line:#332f46;--rec:#ff5d78}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px;max-width:520px;margin-inline:auto}
+h1{font-size:22px;margin:4px 0 2px;letter-spacing:-.01em}
+p.sub{margin:0 0 16px;color:var(--mut);font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button,label.btn{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:10px;padding:10px 12px;cursor:pointer}
+button.on{background:var(--acc);color:var(--accink);border-color:var(--acc)}
+#rec{width:100%;padding:18px;font-size:18px;font-weight:600;background:var(--acc);color:var(--accink);border-color:var(--acc);border-radius:14px}
+#rec.live{background:var(--rec);border-color:var(--rec);color:#fff}
+.ctl{margin:12px 0}
+.ctl div{display:flex;justify-content:space-between;font-size:14px}
+.ctl span:last-child{color:var(--mut);font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;accent-color:var(--acc)}
+.chk{display:flex;gap:10px;align-items:flex-start;font-size:14px;margin:8px 0}
+.chk input{margin-top:3px}
+.note{font-size:13px;color:var(--mut);margin:6px 0 0}
+#status{font-size:14px;color:var(--mut);min-height:20px;margin:8px 0 0;text-align:center}
+audio{width:100%;margin:8px 0}
+#err{color:var(--rec);font-size:14px;margin:6px 0}
+</style>
+</head>
+<body>
+<h1>Voice Switch</h1>
+<p class="sub">Talk in your own voice, get a changed voice back. Everything runs on this device.</p>
+
+<div class="card">
+  <button id="rec">Start recording</button>
+  <div id="status">Ready</div>
+  <div id="err"></div>
+  <label class="chk"><input type="checkbox" id="live"><span>Hear the changed voice while I talk <br><small class="note">Use headphones, or it will feed back.</small></span></label>
+</div>
+
+<div class="card">
+  <div class="row" id="presets">
+    <button data-p="m2f" class="on">Male to female</button>
+    <button data-p="f2m">Female to male</button>
+    <button data-p="clean">Cleanup only</button>
+  </div>
+  <div class="ctl"><div><span>Pitch</span><span id="vSemi"></span></div><input type="range" id="semi" min="-12" max="12" step="0.5" value="5"></div>
+  <div class="ctl"><div><span>Brightness</span><span id="vBri"></span></div><input type="range" id="bri" min="-8" max="12" step="1" value="4"></div>
+  <div class="ctl"><div><span>Background noise removal</span><span id="vGate"></span></div><input type="range" id="gate" min="0" max="100" step="5" value="35"></div>
+  <label class="chk"><input type="checkbox" id="ns" checked><span>Phone noise suppression while recording<br><small class="note">Takes effect on the next recording.</small></span></label>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="again" disabled>Re-apply settings</button>
+    <label class="btn">Use an audio file<input id="file" type="file" accept="audio/*" hidden></label>
+  </div>
+  <audio id="player" controls></audio>
+  <button id="dl" disabled style="width:100%">Save audio (WAV)</button>
+  <p class="note">The saved file is plain WAV audio with no title, artist, date, device or software tags, and it is always named VM_recorded.wav.</p>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const S={semi:5,bri:4,gate:35};
+let ctx=null,stream=null,proc=null,chunks=[],rate=44100,recording=false,rawAll=null,outBlob=null,outUrl=null,live=null;
+
+/* ---- DSP ---- */
+class Shifter{
+  constructor(sr){this.N=Math.floor(sr*0.045);this.L=this.N*2+8;this.b=new Float32Array(this.L);this.w=0;this.p=0;this.r=1}
+  step(x){
+    const N=this.N,L=this.L,b=this.b;
+    b[this.w]=x;
+    this.p+=(1-this.r)/N;this.p-=Math.floor(this.p);
+    let y=0;
+    for(let k=0;k<2;k++){
+      const p=(this.p+k*0.5)%1,d=p*N+2;
+      let rp=this.w-d;if(rp<0)rp+=L;
+      const i=Math.floor(rp),f=rp-i;
+      const s=b[i%L]*(1-f)+b[(i+1)%L]*f,g=Math.sin(Math.PI*p);
+      y+=s*g*g;
+    }
+    this.w=(this.w+1)%L;
+    return y;
+  }
+}
+class Chain{
+  constructor(sr){this.sh=new Shifter(sr);this.env=0;this.g=0;this.cs=null}
+  step(x){
+    if(this.cs!==S.semi){this.cs=S.semi;this.sh.r=Math.pow(2,S.semi/12)}
+    const th=S.gate/100*0.05;
+    if(th>0){
+      const a=Math.abs(x);this.env=a>this.env?a:this.env*0.9996;
+      const t=this.env>th?1:0;this.g+=(t-this.g)*(t>this.g?0.01:0.0006);
+      x*=this.g;
+    }else this.g=1;
+    return this.sh.step(x);
+  }
+}
+function addFilters(c,from,to){
+  const hp=c.createBiquadFilter();hp.type="highpass";hp.frequency.value=90;
+  const sh=c.createBiquadFilter();sh.type="highshelf";sh.frequency.value=3000;sh.gain.value=S.bri;
+  from.connect(hp);hp.connect(sh);sh.connect(to);
+  return sh;
+}
+
+/* ---- WAV (header only, no metadata chunks) ---- */
+function toWav(f,sr){
+  const n=f.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf);
+  const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};
+  w(0,"RIFF");v.setUint32(4,36+n*2,true);w(8,"WAVE");w(12,"fmt ");
+  v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+  w(36,"data");v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++){const s=Math.max(-1,Math.min(1,f[i]));v.setInt16(44+i*2,s<0?s*32768:s*32767,true)}
+  return new Blob([buf],{type:"audio/wav"});
+}
+
+/* ---- convert recorded audio ---- */
+async function convert(){
+  if(!rawAll||!rawAll.length)return;
+  $("status").textContent="Converting...";
+  await new Promise(r=>setTimeout(r,30));
+  const ch=new Chain(rate),y=new Float32Array(rawAll.length);
+  for(let i=0;i<y.length;i++)y[i]=ch.step(rawAll[i]);
+  const oc=new OfflineAudioContext(1,y.length,rate);
+  const b=oc.createBuffer(1,y.length,rate);b.copyToChannel(y,0);
+  const s=oc.createBufferSource();s.buffer=b;
+  addFilters(oc,s,oc.destination);s.start();
+  const r=(await oc.startRendering()).getChannelData(0).slice();
+  let pk=0;for(let i=0;i<r.length;i++){const a=Math.abs(r[i]);if(a>pk)pk=a}
+  if(pk>0){const g=0.9/pk;for(let i=0;i<r.length;i++)r[i]*=g}
+  outBlob=toWav(r,rate);
+  if(outUrl)URL.revokeObjectURL(outUrl);
+  outUrl=URL.createObjectURL(outBlob);
+  $("player").src=outUrl;
+  $("dl").disabled=false;$("again").disabled=false;
+  $("status").textContent="Done. Press play, or save.";
+}
+
+/* ---- recording ---- */
+async function start(){
+  $("err").textContent="";
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:$("ns").checked,autoGainControl:false}});
+  }catch(e){
+    $("err").textContent="Microphone is blocked. Allow microphone access for this page, and open it from https or in Chrome.";
+    return;
+  }
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  rate=ctx.sampleRate;chunks=[];
+  const src=ctx.createMediaStreamSource(stream);
+  proc=ctx.createScriptProcessor(4096,1,1);
+  live=new Chain(rate);
+  const out=ctx.createGain();out.gain.value=$("live").checked?1:0;
+  proc.onaudioprocess=e=>{
+    const i=e.inputBuffer.getChannelData(0),o=e.outputBuffer.getChannelData(0);
+    chunks.push(new Float32Array(i));
+    if(out.gain.value>0)for(let k=0;k<i.length;k++)o[k]=live.step(i[k]);else o.fill(0);
+  };
+  src.connect(proc);
+  const sh=addFilters(ctx,proc,out);
+  out.connect(ctx.destination);
+  $("live").onchange=()=>{out.gain.value=$("live").checked?1:0};
+  window.__sh=sh;
+  recording=true;
+  $("rec").textContent="Stop and convert";$("rec").classList.add("live");
+  const t0=Date.now();
+  window.__tm=setInterval(()=>{const s=Math.floor((Date.now()-t0)/1000);$("status").textContent="Recording "+Math.floor(s/60)+":"+String(s%60).padStart(2,"0")},250);
+}
+async function stop(){
+  recording=false;clearInterval(window.__tm);
+  proc.disconnect();stream.getTracks().forEach(t=>t.stop());
+  await ctx.close();
+  let n=0;chunks.forEach(c=>n+=c.length);
+  rawAll=new Float32Array(n);let o=0;chunks.forEach(c=>{rawAll.set(c,o);o+=c.length});chunks=[];
+  $("rec").textContent="Start recording";$("rec").classList.remove("live");
+  await convert();
+}
+$("rec").onclick=()=>recording?stop():start();
+
+/* ---- file input ---- */
+$("file").onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  $("err").textContent="";$("status").textContent="Reading file...";
+  try{
+    const c=new (window.AudioContext||window.webkitAudioContext)();
+    const b=await c.decodeAudioData(await f.arrayBuffer());
+    rate=b.sampleRate;
+    const m=new Float32Array(b.length);
+    for(let k=0;k<b.numberOfChannels;k++){const d=b.getChannelData(k);for(let i=0;i<m.length;i++)m[i]+=d[i]/b.numberOfChannels}
+    rawAll=m;c.close();await convert();
+  }catch(x){$("err").textContent="Could not read that file.";$("status").textContent="Ready"}
+  e.target.value="";
+};
+
+/* ---- save ---- */
+$("dl").onclick=()=>{
+  if(!outBlob)return;
+  const a=document.createElement("a");a.href=outUrl;a.download="VM_recorded.wav";
+  document.body.appendChild(a);a.click();a.remove();
+};
+$("again").onclick=convert;
+
+/* ---- controls ---- */
+function sync(){
+  $("vSemi").textContent=(S.semi>0?"+":"")+S.semi+" semitones";
+  $("vBri").textContent=(S.bri>0?"+":"")+S.bri+" dB";
+  $("vGate").textContent=S.gate?S.gate+"%":"off";
+  if(window.__sh&&recording)window.__sh.gain.value=S.bri;
+}
+function setAll(s,b,g){S.semi=s;S.bri=b;S.gate=g;$("semi").value=s;$("bri").value=b;$("gate").value=g;sync()}
+$("semi").oninput=e=>{S.semi=+e.target.value;sync();mark()};
+$("bri").oninput=e=>{S.bri=+e.target.value;sync();mark()};
+$("gate").oninput=e=>{S.gate=+e.target.value;sync();mark()};
+function mark(){document.querySelectorAll("#presets button").forEach(b=>b.classList.remove("on"))}
+document.querySelectorAll("#presets button").forEach(b=>b.onclick=()=>{
+  mark();b.classList.add("on");
+  const p=b.dataset.p;
+  if(p==="m2f")setAll(5,4,35);else if(p==="f2m")setAll(-4,-3,35);else setAll(0,0,45);
+});
+sync();
+if("serviceWorker" in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
+</script>
+</body>
+</html>
